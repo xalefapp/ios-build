@@ -1,0 +1,56 @@
+# Public build-only repo (xalefapp/ios-build): no game source lives here. Input: a release (tag) holding xcode.zip
+# (the Xcode export made on Windows). Output: an UNSIGNED .ipa artifact, re-signed on the owner PC with Sideloadly.
+# The release is deleted right after the IPA is downloaded.
+name: iOS unsigned IPA
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag that holds xcode.zip
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+    steps:
+      - name: Download Xcode project
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "${{ inputs.tag }}" --repo "${{ github.repository }}" --pattern xcode.zip
+          unzip -q xcode.zip -d proj
+          chmod +x proj/*.sh || true  # zipped on Windows: restore the exec bit the Xcode run-script phases need
+      - name: CocoaPods (Firebase)
+        working-directory: proj
+        run: |
+          if [ -f Podfile ]; then pod install --repo-update; fi
+      - name: Archive without signing
+        working-directory: proj
+        run: |
+          if [ -d Unity-iPhone.xcworkspace ]; then SRC="-workspace Unity-iPhone.xcworkspace"; else SRC="-project Unity-iPhone.xcodeproj"; fi
+          xcodebuild $SRC -scheme Unity-iPhone -configuration Release -sdk iphoneos \
+            -destination generic/platform=iOS -archivePath "$RUNNER_TEMP/Kavanoz.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" archive | tail -40
+      - name: Package IPA
+        run: |
+          mkdir -p "$RUNNER_TEMP/out/Payload"
+          cp -R "$RUNNER_TEMP/Kavanoz.xcarchive/Products/Applications/"*.app "$RUNNER_TEMP/out/Payload/"
+          # UnityRuntime.framework ships pre-signed by Unity; a re-signer that keeps that signature makes iOS reject the
+          # install (ApplicationVerificationFailed). Strip every signature so the user's Apple ID signs all of it.
+          APP=$(ls -d "$RUNNER_TEMP/out/Payload/"*.app)
+          for fw in "$APP"/Frameworks/*.framework; do
+            bin="$fw/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$fw/Info.plist")"
+            codesign --remove-signature "$bin" || true
+            rm -rf "$fw/_CodeSignature"
+          done
+          codesign --remove-signature "$APP/$(/usr/libexec/PlistBuddy -c 'Print CFBundleExecutable' "$APP/Info.plist")" || true
+          rm -rf "$APP/_CodeSignature"
+          find "$APP" -name _CodeSignature
+          cd "$RUNNER_TEMP/out" && zip -qry Kavanoz.ipa Payload && ls -la Kavanoz.ipa
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kavanoz-ipa
+          path: ${{ runner.temp }}/out/Kavanoz.ipa
+          retention-days: 7
